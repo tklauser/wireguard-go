@@ -103,7 +103,7 @@ func (descriptor *RingDescriptor) Close() {
 	}
 }
 
-func (wintun *Interface) Register(descriptor *RingDescriptor) (windows.Handle, error) {
+func (wintun Adapter) Register(descriptor *RingDescriptor) (windows.Handle, error) {
 	handle, err := wintun.handle()
 	if err != nil {
 		return 0, err

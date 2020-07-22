@@ -33,7 +33,7 @@ type rateJuggler struct {
 }
 
 type NativeTun struct {
-	wt        *wintun.Interface
+	wt        wintun.Adapter
 	handle    windows.Handle
 	close     bool
 	events    chan Event
@@ -44,7 +44,7 @@ type NativeTun struct {
 	writeLock sync.Mutex
 }
 
-const WintunPool = wintun.Pool("WireGuard")
+var WintunPool = wintun.MakePool("WireGuard")
 
 //go:linkname procyield runtime.procyield
 func procyield(cycles uint32)
@@ -66,18 +66,19 @@ func CreateTUN(ifname string, mtu int) (Device, error) {
 //
 func CreateTUNWithRequestedGUID(ifname string, requestedGUID *windows.GUID, mtu int) (Device, error) {
 	var err error
-	var wt *wintun.Interface
+	var wt wintun.Adapter
 
 	// Does an interface with this name already exist?
-	wt, err = WintunPool.GetInterface(ifname)
+	wt, err = WintunPool.Adapter(ifname)
 	if err == nil {
 		// If so, we delete it, in case it has weird residual configuration.
-		_, err = wt.DeleteInterface()
+		_, err = wt.Delete()
 		if err != nil {
 			return nil, fmt.Errorf("Error deleting already existing interface: %v", err)
 		}
+		wt.Close()
 	}
-	wt, _, err = WintunPool.CreateInterface(ifname, requestedGUID)
+	wt, _, err = WintunPool.CreateAdapter(ifname, requestedGUID)
 	if err != nil {
 		return nil, fmt.Errorf("Error creating interface: %v", err)
 	}
@@ -131,8 +132,9 @@ func (tun *NativeTun) Close() error {
 	}
 	tun.rings.Close()
 	var err error
-	if tun.wt != nil {
-		_, err = tun.wt.DeleteInterface()
+	if tun.wt != 0 {
+		_, err = tun.wt.Delete()
+		tun.wt.Close()
 	}
 	close(tun.events)
 	return err
@@ -256,7 +258,7 @@ func (tun *NativeTun) LUID() uint64 {
 
 // Version returns the version of the Wintun driver and NDIS system currently loaded.
 func (tun *NativeTun) Version() (driverVersion string, ndisVersion string, err error) {
-	return tun.wt.Version()
+	return wintun.Version()
 }
 
 func (rate *rateJuggler) update(packetLen uint64) {
