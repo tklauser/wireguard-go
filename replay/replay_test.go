@@ -14,106 +14,106 @@ import (
  *
  */
 
-const RejectAfterMessages = (1 << 64) - (1 << 4) - 1
+const RejectAfterMessages = 1<<64 - 1<<13 - 1
 
 func TestReplay(t *testing.T) {
-	var filter ReplayFilter
+	var filter Filter
 
-	T_LIM := CounterWindowSize + 1
+	const T_LIM = windowSize + 1
 
 	testNumber := 0
-	T := func(n uint64, v bool) {
+	T := func(counter uint64, expected bool) {
 		testNumber++
-		if filter.ValidateCounter(n, RejectAfterMessages) != v {
-			t.Fatal("Test", testNumber, "failed", n, v)
+		if filter.ValidateCounter(counter, RejectAfterMessages) == expected {
+			t.Fatal("Test", testNumber, "failed", counter, expected)
 		}
 	}
 
-	filter.Init()
+	filter.Reset()
 
-	T(0, true)                      /*  1 */
-	T(1, true)                      /*  2 */
-	T(1, false)                     /*  3 */
-	T(9, true)                      /*  4 */
-	T(8, true)                      /*  5 */
-	T(7, true)                      /*  6 */
-	T(7, false)                     /*  7 */
-	T(T_LIM, true)                  /*  8 */
-	T(T_LIM-1, true)                /*  9 */
-	T(T_LIM-1, false)               /* 10 */
-	T(T_LIM-2, true)                /* 11 */
-	T(2, true)                      /* 12 */
-	T(2, false)                     /* 13 */
-	T(T_LIM+16, true)               /* 14 */
-	T(3, false)                     /* 15 */
-	T(T_LIM+16, false)              /* 16 */
-	T(T_LIM*4, true)                /* 17 */
-	T(T_LIM*4-(T_LIM-1), true)      /* 18 */
-	T(10, false)                    /* 19 */
-	T(T_LIM*4-T_LIM, false)         /* 20 */
-	T(T_LIM*4-(T_LIM+1), false)     /* 21 */
-	T(T_LIM*4-(T_LIM-2), true)      /* 22 */
-	T(T_LIM*4+1-T_LIM, false)       /* 23 */
-	T(0, false)                     /* 24 */
-	T(RejectAfterMessages, false)   /* 25 */
-	T(RejectAfterMessages-1, true)  /* 26 */
-	T(RejectAfterMessages, false)   /* 27 */
-	T(RejectAfterMessages-1, false) /* 28 */
-	T(RejectAfterMessages-2, true)  /* 29 */
-	T(RejectAfterMessages+1, false) /* 30 */
-	T(RejectAfterMessages+2, false) /* 31 */
-	T(RejectAfterMessages-2, false) /* 32 */
-	T(RejectAfterMessages-3, true)  /* 33 */
-	T(0, false)                     /* 34 */
+	T(0, false)                     /*  1 */
+	T(1, false)                     /*  2 */
+	T(1, true)                      /*  3 */
+	T(9, false)                     /*  4 */
+	T(8, false)                     /*  5 */
+	T(7, false)                     /*  6 */
+	T(7, true)                      /*  7 */
+	T(T_LIM, false)                 /*  8 */
+	T(T_LIM-1, false)               /*  9 */
+	T(T_LIM-1, true)                /* 10 */
+	T(T_LIM-2, false)               /* 11 */
+	T(2, false)                     /* 12 */
+	T(2, true)                      /* 13 */
+	T(T_LIM+16, false)              /* 14 */
+	T(3, true)                      /* 15 */
+	T(T_LIM+16, true)               /* 16 */
+	T(T_LIM*4, false)               /* 17 */
+	T(T_LIM*4-(T_LIM-1), false)     /* 18 */
+	T(10, true)                     /* 19 */
+	T(T_LIM*4-T_LIM, true)          /* 20 */
+	T(T_LIM*4-(T_LIM+1), true)      /* 21 */
+	T(T_LIM*4-(T_LIM-2), false)     /* 22 */
+	T(T_LIM*4+1-T_LIM, true)        /* 23 */
+	T(0, true)                      /* 24 */
+	T(RejectAfterMessages, true)    /* 25 */
+	T(RejectAfterMessages-1, false) /* 26 */
+	T(RejectAfterMessages, true)    /* 27 */
+	T(RejectAfterMessages-1, true)  /* 28 */
+	T(RejectAfterMessages-2, false) /* 29 */
+	T(RejectAfterMessages+1, true)  /* 30 */
+	T(RejectAfterMessages+2, true)  /* 31 */
+	T(RejectAfterMessages-2, true)  /* 32 */
+	T(RejectAfterMessages-3, false) /* 33 */
+	T(0, true)                      /* 34 */
 
 	t.Log("Bulk test 1")
-	filter.Init()
+	filter.Reset()
 	testNumber = 0
-	for i := uint64(1); i <= CounterWindowSize; i++ {
-		T(i, true)
+	for i := uint64(1); i <= windowSize; i++ {
+		T(i, false)
 	}
-	T(0, true)
 	T(0, false)
+	T(0, true)
 
 	t.Log("Bulk test 2")
-	filter.Init()
+	filter.Reset()
 	testNumber = 0
-	for i := uint64(2); i <= CounterWindowSize+1; i++ {
-		T(i, true)
+	for i := uint64(2); i <= windowSize+1; i++ {
+		T(i, false)
 	}
-	T(1, true)
-	T(0, false)
+	T(1, false)
+	T(0, true)
 
 	t.Log("Bulk test 3")
-	filter.Init()
+	filter.Reset()
 	testNumber = 0
-	for i := CounterWindowSize + 1; i > 0; i-- {
-		T(i, true)
+	for i := uint64(windowSize) + 1; i > 0; i-- {
+		T(i, false)
 	}
 
 	t.Log("Bulk test 4")
-	filter.Init()
+	filter.Reset()
 	testNumber = 0
-	for i := CounterWindowSize + 2; i > 1; i-- {
-		T(i, true)
-	}
-	T(0, false)
-
-	t.Log("Bulk test 5")
-	filter.Init()
-	testNumber = 0
-	for i := CounterWindowSize; i > 0; i-- {
-		T(i, true)
-	}
-	T(CounterWindowSize+1, true)
-	T(0, false)
-
-	t.Log("Bulk test 6")
-	filter.Init()
-	testNumber = 0
-	for i := CounterWindowSize; i > 0; i-- {
-		T(i, true)
+	for i := uint64(windowSize) + 2; i > 1; i-- {
+		T(i, false)
 	}
 	T(0, true)
-	T(CounterWindowSize+1, true)
+
+	t.Log("Bulk test 5")
+	filter.Reset()
+	testNumber = 0
+	for i := uint64(windowSize); i > 0; i-- {
+		T(i, false)
+	}
+	T(windowSize+1, false)
+	T(0, true)
+
+	t.Log("Bulk test 6")
+	filter.Reset()
+	testNumber = 0
+	for i := uint64(windowSize); i > 0; i-- {
+		T(i, false)
+	}
+	T(0, false)
+	T(windowSize+1, false)
 }

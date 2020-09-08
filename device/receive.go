@@ -538,7 +538,6 @@ func (peer *Peer) RoutineSequentialReceiver() {
 		}
 
 		// check for replay
-
 		if !elem.keypair.replayFilter.ValidateCounter(elem.counter, RejectAfterMessages) {
 			continue
 		}
