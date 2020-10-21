@@ -8,6 +8,7 @@ package wintun
 import (
 	"fmt"
 	"log"
+	"syscall"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -29,14 +30,28 @@ const (
 type Pool [MAX_POOL]uint16
 type Adapter uintptr
 
-//sys	wintunSetLogger(logger uintptr) = wintun.WintunSetLogger
+var (
+	modwintun = newLazyDLL("wintun.dll")
+
+	procWintunSetLogger              = modwintun.NewProc("WintunSetLogger")
+	procWintunFreeAdapter            = modwintun.NewProc("WintunFreeAdapter")
+	procWintunGetAdapter             = modwintun.NewProc("WintunGetAdapter")
+	procWintunCreateAdapter          = modwintun.NewProc("WintunCreateAdapter")
+	procWintunDeleteAdapter          = modwintun.NewProc("WintunDeleteAdapter")
+	procWintunEnumAdapters           = modwintun.NewProc("WintunEnumAdapters")
+	procWintunGetAdapterName         = modwintun.NewProc("WintunGetAdapterName")
+	procWintunSetAdapterName         = modwintun.NewProc("WintunSetAdapterName")
+	procWintunGetVersion             = modwintun.NewProc("WintunGetVersion")
+	procWintunGetAdapterDeviceObject = modwintun.NewProc("WintunGetAdapterDeviceObject")
+	procWintunGetAdapterGUID         = modwintun.NewProc("WintunGetAdapterGUID")
+	procWintunGetAdapterLUID         = modwintun.NewProc("WintunGetAdapterLUID")
+)
 
 func init() {
-	logger := func(level loggerLevel, msg *uint16) int {
+	syscall.Syscall(procWintunSetLogger.Addr(), 1, uintptr(windows.NewCallback(func(level loggerLevel, msg *uint16) int {
 		log.Println("[Wintun]", windows.UTF16ToString((*[(1 << 30) - 1]uint16)(unsafe.Pointer(msg))[:]))
 		return 0
-	}
-	wintunSetLogger(windows.NewCallback(logger))
+	})), 0, 0)
 }
 
 func MakePool(poolName string) (pool Pool) {
@@ -52,14 +67,10 @@ func (pool Pool) String() string {
 	return windows.UTF16ToString(pool[:])
 }
 
-//sys	wintunFreeAdapter(adapter Adapter) = wintun.WintunFreeAdapter
-
 // Close releases the Wintun adapter resources.
 func (wintun Adapter) Close() {
-	wintunFreeAdapter(wintun)
+	syscall.Syscall(procWintunFreeAdapter.Addr(), 1, uintptr(wintun), 0, 0)
 }
-
-//sys	wintunGetAdapter(pool *uint16, name *uint16, adapter *Adapter) (ret error) = wintun.WintunGetAdapter
 
 // Adapter finds a Wintun adapter by its name. This function returns the adapter if found, or
 // windows.ERROR_FILE_NOT_FOUND otherwise. If the adapter is found but not a Wintun-class or a
@@ -70,11 +81,12 @@ func (pool Pool) Adapter(ifname string) (adapter Adapter, err error) {
 	if err != nil {
 		return 0, err
 	}
-	err = wintunGetAdapter(&pool[0], ifname16, &adapter)
+	r0, _, _ := syscall.Syscall(procWintunGetAdapter.Addr(), 3, uintptr(unsafe.Pointer(&pool[0])), uintptr(unsafe.Pointer(ifname16)), uintptr(unsafe.Pointer(&adapter)))
+	if r0 != 0 {
+		err = syscall.Errno(r0)
+	}
 	return
 }
-
-//sys	wintunCreateAdapter(pool *uint16, name *uint16, requestedGUID *windows.GUID, adapter *Adapter, rebootRequired *bool) (ret error) = wintun.WintunCreateAdapter
 
 // CreateAdapter creates a Wintun adapter. ifname is the requested name of the adapter, while
 // requestedGUID is the GUID of the created network adapter, which then influences NLA generation
@@ -88,20 +100,26 @@ func (pool Pool) CreateAdapter(ifname string, requestedGUID *windows.GUID) (wint
 	if err != nil {
 		return
 	}
-	err = wintunCreateAdapter(&pool[0], ifname16, requestedGUID, &wintun, &rebootRequired)
+	var _p0 uint32
+	r0, _, _ := syscall.Syscall6(procWintunCreateAdapter.Addr(), 5, uintptr(unsafe.Pointer(&pool[0])), uintptr(unsafe.Pointer(ifname16)), uintptr(unsafe.Pointer(requestedGUID)), uintptr(unsafe.Pointer(&wintun)), uintptr(unsafe.Pointer(&_p0)), 0)
+	rebootRequired = _p0 != 0
+	if r0 != 0 {
+		err = syscall.Errno(r0)
+	}
 	return
 }
-
-//sys	wintunDeleteAdapter(adapter Adapter, rebootRequired *bool) (ret error) = wintun.WintunDeleteAdapter
 
 // Delete deletes a Wintun adapter. This function succeeds if the adapter was not found. It returns
 // a bool indicating whether a reboot is required.
 func (wintun Adapter) Delete() (rebootRequired bool, err error) {
-	err = wintunDeleteAdapter(wintun, &rebootRequired)
+	var _p0 uint32
+	r0, _, _ := syscall.Syscall(procWintunDeleteAdapter.Addr(), 2, uintptr(wintun), uintptr(unsafe.Pointer(&_p0)), 0)
+	rebootRequired = _p0 != 0
+	if r0 != 0 {
+		err = syscall.Errno(r0)
+	}
 	return
 }
-
-//sys	wintunEnumAdapters(pool *uint16, cb uintptr, param uintptr) (ret error) = wintun.WintunEnumAdapters
 
 // DeleteMatchingAdapters deletes all Wintun adapters, which match
 // given criteria, and returns which ones it deleted, whether a reboot
@@ -120,30 +138,26 @@ func (pool Pool) DeleteMatchingAdapters(matches func(adapter Adapter) bool) (ada
 		adaptersDeleted = append(adaptersDeleted, adapter.GUID())
 		return 1
 	}
-	err := wintunEnumAdapters(&pool[0], windows.NewCallback(cb), 0)
-	if err != nil {
-		errors = append(errors, err)
+	r0, _, _ := syscall.Syscall(procWintunEnumAdapters.Addr(), 3, uintptr(unsafe.Pointer(&pool[0])), uintptr(windows.NewCallback(cb)), 0)
+	if r0 != 0 {
+		errors = append(errors, syscall.Errno(r0))
 	}
 	return
 }
 
-//sys	wintunGetAdapterName(adapter Adapter, name *uint16) (ret error) = wintun.WintunGetAdapterName
-
 // Name returns the name of the Wintun adapter.
 func (wintun Adapter) Name() (ifname string, err error) {
 	var ifname16 [MAX_ADAPTER_NAME]uint16
-	err = wintunGetAdapterName(wintun, &ifname16[0])
-	if err != nil {
-		return "", err
+	r0, _, _ := syscall.Syscall(procWintunGetAdapterName.Addr(), 2, uintptr(wintun), uintptr(unsafe.Pointer(&ifname16[0])), 0)
+	if r0 != 0 {
+		return "", syscall.Errno(r0)
 	}
 	ifname = windows.UTF16ToString(ifname16[:])
 	return
 }
 
-//sys	wintunSetAdapterName(adapter Adapter, name *uint16) (ret error) = wintun.WintunSetAdapterName
-
 // SetName sets name of the Wintun adapter.
-func (wintun Adapter) SetName(ifname string) error {
+func (wintun Adapter) SetName(ifname string) (err error) {
 	ifname16, err := windows.UTF16FromString(ifname)
 	if err != nil {
 		return err
@@ -151,16 +165,19 @@ func (wintun Adapter) SetName(ifname string) error {
 	if len(ifname16) > MAX_ADAPTER_NAME {
 		ifname16 = append(ifname16[:MAX_ADAPTER_NAME-1], 0)
 	}
-	return wintunSetAdapterName(wintun, &ifname16[0])
+	r0, _, _ := syscall.Syscall(procWintunSetAdapterName.Addr(), 2, uintptr(wintun), uintptr(unsafe.Pointer(&ifname16[0])), 0)
+	if r0 != 0 {
+		err = syscall.Errno(r0)
+	}
+	return
 }
-
-//sys	wintunGetVersion(driverVersionMaj *uint32, driverVersionMin *uint32, ndisVersionMaj *uint32, ndisVersionMin *uint32) (ret error) = wintun.WintunGetVersion
 
 // Version returns the version of the Wintun driver and NDIS system currently loaded.
 func Version() (driverVersion string, ndisVersion string, err error) {
 	var driverMajor, driverMinor, ndisMajor, ndisMinor uint32
-	err = wintunGetVersion(&driverMajor, &driverMinor, &ndisMajor, &ndisMinor)
-	if err != nil {
+	r0, _, _ := syscall.Syscall6(procWintunGetVersion.Addr(), 4, uintptr(unsafe.Pointer(&driverMajor)), uintptr(unsafe.Pointer(&driverMinor)), uintptr(unsafe.Pointer(&ndisMajor)), uintptr(unsafe.Pointer(&ndisMinor)), 0, 0)
+	if r0 != 0 {
+		err = syscall.Errno(r0)
 		return
 	}
 	driverVersion = fmt.Sprintf("%d.%d", driverMajor, driverMinor)
@@ -168,26 +185,23 @@ func Version() (driverVersion string, ndisVersion string, err error) {
 	return
 }
 
-//sys	wintunGetAdapterDeviceObject(adapter Adapter, handle *windows.Handle) (ret error) = wintun.WintunGetAdapterDeviceObject
-
 // handle returns a handle to the adapter device object. Release handle with windows.CloseHandle
 func (wintun Adapter) handle() (handle windows.Handle, err error) {
-	err = wintunGetAdapterDeviceObject(wintun, &handle)
+	r0, _, _ := syscall.Syscall(procWintunGetAdapterDeviceObject.Addr(), 2, uintptr(wintun), uintptr(unsafe.Pointer(&handle)), 0)
+	if r0 != 0 {
+		err = syscall.Errno(r0)
+	}
 	return
 }
-
-//sys	wintunGetAdapterGUID(adapter Adapter, guid *windows.GUID) = wintun.WintunGetAdapterGUID
 
 // GUID returns the GUID of the adapter.
 func (wintun Adapter) GUID() (guid windows.GUID) {
-	wintunGetAdapterGUID(wintun, &guid)
+	syscall.Syscall(procWintunGetAdapterGUID.Addr(), 2, uintptr(wintun), uintptr(unsafe.Pointer(&guid)), 0)
 	return
 }
 
-//sys	wintunGetAdapterLUID(adapter Adapter, luid *uint64) = wintun.WintunGetAdapterLUID
-
 // LUID returns the LUID of the adapter.
 func (wintun Adapter) LUID() (luid uint64) {
-	wintunGetAdapterLUID(wintun, &luid)
+	syscall.Syscall(procWintunGetAdapterLUID.Addr(), 2, uintptr(wintun), uintptr(unsafe.Pointer(&luid)), 0)
 	return
 }
