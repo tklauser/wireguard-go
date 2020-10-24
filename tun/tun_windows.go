@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"sync"
 	"sync/atomic"
 	"time"
 	"unsafe"
@@ -40,8 +39,7 @@ type NativeTun struct {
 	errors    chan error
 	forcedMTU int
 	rate      rateJuggler
-	rings     *wintun.RingDescriptor
-	writeLock sync.Mutex
+	session   wintun.Session
 }
 
 var WintunPool = wintun.MakePool("WireGuard")
@@ -51,6 +49,10 @@ func procyield(cycles uint32)
 
 //go:linkname nanotime runtime.nanotime
 func nanotime() int64
+
+// dummy prevents `imported and not used: "unsafe"` vs. `//go:linkname only allowed in Go
+// files that import "unsafe"` paradox.
+var dummy = unsafe.Sizeof(rateJuggler{})
 
 //
 // CreateTUN creates a Wintun interface with the given name. Should a Wintun
@@ -96,16 +98,10 @@ func CreateTUNWithRequestedGUID(ifname string, requestedGUID *windows.GUID, mtu 
 		forcedMTU: forcedMTU,
 	}
 
-	tun.rings, err = wintun.NewRingDescriptor()
+	tun.session, err = wt.StartSession(0x800000) // Ring capacity, 8 MiB
 	if err != nil {
 		tun.Close()
-		return nil, fmt.Errorf("Error creating events: %v", err)
-	}
-
-	tun.handle, err = tun.wt.Register(tun.rings)
-	if err != nil {
-		tun.Close()
-		return nil, fmt.Errorf("Error registering rings: %v", err)
+		return nil, fmt.Errorf("Error starting session: %v", err)
 	}
 	return tun, nil
 }
@@ -124,13 +120,9 @@ func (tun *NativeTun) Events() chan Event {
 
 func (tun *NativeTun) Close() error {
 	tun.close = true
-	if tun.rings.Send.TailMoved != 0 {
-		windows.SetEvent(tun.rings.Send.TailMoved) // wake the reader if it's sleeping
+	if tun.session != 0 {
+		tun.session.End()
 	}
-	if tun.handle != windows.InvalidHandle {
-		windows.CloseHandle(tun.handle)
-	}
-	tun.rings.Close()
 	var err error
 	if tun.wt != 0 {
 		_, err = tun.wt.Delete()
@@ -162,52 +154,39 @@ retry:
 		return 0, os.ErrClosed
 	}
 
-	buffHead := atomic.LoadUint32(&tun.rings.Send.Ring.Head)
-	if buffHead >= wintun.PacketCapacity {
-		return 0, os.ErrClosed
-	}
-
 	start := nanotime()
 	shouldSpin := atomic.LoadUint64(&tun.rate.current) >= spinloopRateThreshold && uint64(start-atomic.LoadInt64(&tun.rate.nextStartTime)) <= rateMeasurementGranularity*2
-	var buffTail uint32
 	for {
-		buffTail = atomic.LoadUint32(&tun.rings.Send.Ring.Tail)
-		if buffHead != buffTail {
+		if tun.session.IsPacketAvailable() {
 			break
 		}
 		if tun.close {
 			return 0, os.ErrClosed
 		}
 		if !shouldSpin || uint64(nanotime()-start) >= spinloopDuration {
-			windows.WaitForSingleObject(tun.rings.Send.TailMoved, windows.INFINITE)
+			tun.session.WaitForPacket(windows.INFINITE)
 			goto retry
 		}
 		procyield(1)
 	}
-	if buffTail >= wintun.PacketCapacity {
+
+	packet, err := tun.session.ReceivePacket()
+	if err == nil {
+		packetSize := len(packet)
+		copy(buff[offset:], packet)
+		tun.session.ReceiveRelease(packet)
+		tun.rate.update(uint64(packetSize))
+		return packetSize, nil
+	}
+	switch err {
+	case windows.ERROR_HANDLE_EOF:
 		return 0, os.ErrClosed
+	case windows.ERROR_INVALID_DATA:
+		return 0, errors.New("send ring corrupt")
+	case windows.ERROR_NO_MORE_ITEMS:
+		goto retry
 	}
-
-	buffContent := tun.rings.Send.Ring.Wrap(buffTail - buffHead)
-	if buffContent < uint32(unsafe.Sizeof(wintun.PacketHeader{})) {
-		return 0, errors.New("incomplete packet header in send ring")
-	}
-
-	packet := (*wintun.Packet)(unsafe.Pointer(&tun.rings.Send.Ring.Data[buffHead]))
-	if packet.Size > wintun.PacketSizeMax {
-		return 0, errors.New("packet too big in send ring")
-	}
-
-	alignedPacketSize := wintun.PacketAlign(uint32(unsafe.Sizeof(wintun.PacketHeader{})) + packet.Size)
-	if alignedPacketSize > buffContent {
-		return 0, errors.New("incomplete packet in send ring")
-	}
-
-	copy(buff[offset:], packet.Data[:packet.Size])
-	buffHead = tun.rings.Send.Ring.Wrap(buffHead + alignedPacketSize)
-	atomic.StoreUint32(&tun.rings.Send.Ring.Head, buffHead)
-	tun.rate.update(uint64(packet.Size))
-	return int(packet.Size), nil
+	return 0, fmt.Errorf("Read failed: %v", err)
 }
 
 func (tun *NativeTun) Flush() error {
@@ -219,36 +198,22 @@ func (tun *NativeTun) Write(buff []byte, offset int) (int, error) {
 		return 0, os.ErrClosed
 	}
 
-	packetSize := uint32(len(buff) - offset)
-	tun.rate.update(uint64(packetSize))
-	alignedPacketSize := wintun.PacketAlign(uint32(unsafe.Sizeof(wintun.PacketHeader{})) + packetSize)
+	packetSize := len(buff) - offset
+	tun.rate.update(uint64(packetSize)) // TODO: Should writes really affect the rateJuggler used by reading?
 
-	tun.writeLock.Lock()
-	defer tun.writeLock.Unlock()
-
-	buffHead := atomic.LoadUint32(&tun.rings.Receive.Ring.Head)
-	if buffHead >= wintun.PacketCapacity {
-		return 0, os.ErrClosed
+	packet, err := tun.session.AllocateSendPacket(packetSize)
+	if err == nil {
+		copy(packet, buff[offset:])
+		tun.session.SendPacket(packet)
+		return packetSize, nil
 	}
-
-	buffTail := atomic.LoadUint32(&tun.rings.Receive.Ring.Tail)
-	if buffTail >= wintun.PacketCapacity {
+	switch err {
+	case windows.ERROR_HANDLE_EOF:
 		return 0, os.ErrClosed
-	}
-
-	buffSpace := tun.rings.Receive.Ring.Wrap(buffHead - buffTail - wintun.PacketAlignment)
-	if alignedPacketSize > buffSpace {
+	case windows.ERROR_BUFFER_OVERFLOW:
 		return 0, nil // Dropping when ring is full.
 	}
-
-	packet := (*wintun.Packet)(unsafe.Pointer(&tun.rings.Receive.Ring.Data[buffTail]))
-	packet.Size = packetSize
-	copy(packet.Data[:packetSize], buff[offset:])
-	atomic.StoreUint32(&tun.rings.Receive.Ring.Tail, tun.rings.Receive.Ring.Wrap(buffTail+alignedPacketSize))
-	if atomic.LoadInt32(&tun.rings.Receive.Ring.Alertable) != 0 {
-		windows.SetEvent(tun.rings.Receive.TailMoved)
-	}
-	return int(packetSize), nil
+	return 0, fmt.Errorf("Write failed: %v", err)
 }
 
 // LUID returns Windows interface instance ID.
